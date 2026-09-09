@@ -445,18 +445,14 @@ function piAliasName(name: string): string {
   return PI_RESERVED_TOOL_NAMES.has(name) ? PI_ALIAS_PREFIX + name : name;
 }
 
-// piAliasNote tells the model which tools got aliased this session, so it
-// can translate bare names in Gortex's own guidance. Pi-local by design —
-// not a fact any other agent needs.
-function piAliasNote(): string {
-  const aliased = Array.from(gortexToolNames).filter((n) => n.startsWith(PI_ALIAS_PREFIX));
-  if (aliased.length === 0) return "";
-  const pairs = aliased
-    .map((n) => `\`${n.slice(PI_ALIAS_PREFIX.length)}\` -> \`${n}\``)
-    .join(", ");
+// piAliasedDescription front-loads the rename into the tool's own
+// description.
+function piAliasedDescription(bare: string, aliased: string, description: string): string {
+  if (bare === aliased) return description;
   return (
-    `[Gortex] This session renamed these Gortex tools to avoid colliding with Pi's own built-ins ` +
-    `of the same name: ${pairs}. Wherever Gortex's guidance or tool descriptions mention the bare name, call the renamed one instead.`
+    `Gortex's \`${bare}\` tool, registered as \`${aliased}\` because Pi has a built-in ` +
+    `\`${bare}\`. Gortex guidance and denial messages that name \`${bare}\` mean this tool.` +
+    `\n\n${description}`
   );
 }
 
@@ -512,7 +508,7 @@ function registerOneTool(pi: any, desc: ToolDescriptor): void {
   const def: any = {
     name,
     label: name,
-    description: (desc.description || name).trim(),
+    description: piAliasedDescription(name, piAliasName(name), (desc.description || name).trim()),
     parameters,
     async execute(_id: string, params: Record<string, unknown>) {
       if (!client) throw new Error(`gortex ${name}: MCP bridge is not connected`);
@@ -586,6 +582,16 @@ function scheduleSyncTools(pi: any): void {
 // Extension entry point
 // ---------------------------------------------------------------------------
 
+// How long before_agent_start waits for session_start to finish. Pi arms
+// the editor's submit handler well before session_start runs — at startup
+// (interactive-mode.js init()), across /reload (agent-session.js reload()
+// awaits a settings + resource reload first) and across /new
+// (agent-session-runtime.js newSession() awaits teardown + runtime build
+// first) — so a fast prompt can reach the agent loop while registration is
+// still pending or hasn't even begun. Capped so a wedged daemon costs the
+// first turn seconds; start() alone can take ~2 min.
+const READY_WAIT_MS = 15_000;
+
 export default function (pi: any) {
   let orientationInjected = false;
   // Orientation awaiting injection into the next LLM call. The `context`
@@ -593,6 +599,46 @@ export default function (pi: any) {
   // systemPrompt: a systemPrompt change sits at messages[0] and invalidates
   // prefix prompt caching. Computed once per session.
   let pendingOrientation = "";
+
+  // Settles when the current session_start handler is done — bridge up and
+  // tools registered, or the handshake failed. Never rejects.
+  //
+  // Armed at factory time: /reload re-imports this module (resource-loader.js
+  // clears the extension cache, and the loader runs jiti with
+  // moduleCache:false) and /new builds a fresh runtime, so an instance can be
+  // asked for a turn before its own session_start fires. Every path that
+  // constructs an extension goes on to emit session_start, so the wait ends.
+  let sessionReady!: Promise<void>;
+  let settleSessionReady: () => void = () => {};
+  let sessionReadyPending = false;
+
+  function armSessionReady(): void {
+    if (sessionReadyPending) return; // keep the promise parked waiters hold
+    sessionReadyPending = true;
+    sessionReady = new Promise<void>((resolve) => {
+      settleSessionReady = () => {
+        sessionReadyPending = false;
+        resolve();
+      };
+    });
+  }
+  armSessionReady();
+
+  function waitForSession(ms: number): Promise<void> {
+    const ready = sessionReady;
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      (timer as any)?.unref?.();
+      ready.then(done, done);
+    });
+  }
 
   // Pi resets the session's tool registry on every session_start, so
   // (re)register here. Clear the name guard first — it persists across
@@ -602,6 +648,17 @@ export default function (pi: any) {
     orientationInjected = false;
     pendingOrientation = "";
     bridgeError = "";
+    armSessionReady(); // no-op when a turn is already parked on this session
+    try {
+      await startSession();
+    } finally {
+      settleSessionReady();
+    }
+  });
+
+  // startSession holds the body of session_start so the readiness promise
+  // above settles on every exit path, early returns included.
+  async function startSession(): Promise<void> {
     ensureDaemon();
     gortexToolNames.clear();
     if (syncTimer) {
@@ -634,12 +691,15 @@ export default function (pi: any) {
         bridgeError = err?.message || String(err);
       }
     }
-  });
+  }
 
   // Fires before the agent loop's first LLM call. It can't mutate messages
   // itself, so it just parks the orientation for the `context` hook.
-  pi.on("before_agent_start", () => {
+  pi.on("before_agent_start", async () => {
     if (orientationInjected) return;
+    // Pi awaits each listener, so this holds the turn until the tools are
+    // registered and bridgeError reflects the handshake (or the cap expires).
+    await waitForSession(READY_WAIT_MS);
     const decision = callHook({ event: "session_start", cwd: pi?.cwd ?? process.cwd() });
     const parts: string[] = [];
     if (bridgeError) {
@@ -650,8 +710,6 @@ export default function (pi: any) {
       bridgeError = "";
     }
     if (decision.orientation) parts.push(decision.orientation);
-    const aliasNote = piAliasNote();
-    if (aliasNote) parts.push(aliasNote);
     if (parts.length > 0) {
       pendingOrientation = parts.join("\n\n");
       orientationInjected = true;
@@ -661,13 +719,14 @@ export default function (pi: any) {
 
   // Fires before each LLM call with a mutable message array. Append the
   // parked orientation once, then clear it so it isn't repeated each call.
+  // Cleared once the push lands, so the orientation survives a context shape
+  // this hook can't append to.
   pi.on("context", (event: any) => {
     if (!pendingOrientation) return;
-    const text = pendingOrientation;
-    pendingOrientation = "";
     try {
       if (event && Array.isArray(event.messages)) {
-        event.messages.push({ role: "user", content: text });
+        event.messages.push({ role: "user", content: pendingOrientation });
+        pendingOrientation = "";
         return { messages: event.messages };
       }
     } catch {
